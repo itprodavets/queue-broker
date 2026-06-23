@@ -1,6 +1,3 @@
 # compiled binaries
 /broker
 /broker_race
-
-# local archive of the job posting — delete this line if you want it in the repo
-/vacancy.md
