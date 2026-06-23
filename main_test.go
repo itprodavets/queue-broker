@@ -230,3 +230,64 @@ func TestHandlerDelegatesToProducerAndConsumer(t *testing.T) {
 		t.Fatalf("consumer body = %q, want stubbed", body)
 	}
 }
+
+// TestEmptyQueuesAreReclaimed checks that touching a queue without leaving data
+// behind (an empty GET, a drained queue, an expired waiter) leaks no map entry.
+func TestEmptyQueuesAreReclaimed(t *testing.T) {
+	b := newBroker()
+	b.Take(context.Background(), "ghost", 0)                     // GET on a fresh queue
+	b.Put("drained", "m")                                        // produce...
+	b.Take(context.Background(), "drained", 0)                   // ...and fully consume
+	b.Take(context.Background(), "expired", 10*time.Millisecond) // a waiter that times out
+	if n := len(b.queues); n != 0 {
+		t.Fatalf("broker retains %d empty queues, want 0", n)
+	}
+}
+
+// TestNoMessageLostWhenConsumersDisconnect floods the broker with consumers that
+// disconnect while racing delivery, and asserts every produced message is either
+// received once or recoverable from the queue — never lost, never duplicated.
+func TestNoMessageLostWhenConsumersDisconnect(t *testing.T) {
+	b := newBroker()
+	const n = 200
+	received := make(chan string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithCancel(context.Background())
+			go cancel() // disconnect, racing with delivery
+			if m, ok := b.Take(ctx, "q", 2*time.Second); ok {
+				received <- m
+			}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); b.Put("q", strconv.Itoa(i)) }(i)
+	}
+	wg.Wait()
+	close(received)
+
+	seen := make(map[string]bool, n)
+	for m := range received {
+		if seen[m] {
+			t.Fatalf("message %q delivered twice", m)
+		}
+		seen[m] = true
+	}
+	for { // whatever was not delivered must still be in the queue
+		m, ok := b.Take(context.Background(), "q", 0)
+		if !ok {
+			break
+		}
+		if seen[m] {
+			t.Fatalf("message %q both delivered and re-queued", m)
+		}
+		seen[m] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("accounted for %d of %d messages; some were lost", len(seen), n)
+	}
+}

@@ -30,6 +30,18 @@ type queue struct {
 	waiters  []chan string
 }
 
+// dispatch hands msg to the oldest waiting consumer and reports whether one was
+// waiting. The caller must hold the broker lock.
+func (q *queue) dispatch(msg string) bool {
+	if len(q.waiters) == 0 {
+		return false
+	}
+	w := q.waiters[0]
+	q.waiters = q.waiters[1:]
+	w <- msg // buffered (cap 1): never blocks while holding the lock
+	return true
+}
+
 // broker is a thread-safe set of named in-memory queues. It implements both
 // Producer and Consumer.
 type broker struct {
@@ -51,19 +63,22 @@ func (b *broker) queue(name string) *queue {
 	return q
 }
 
-// Put hands the message to the oldest waiting consumer if one exists, otherwise
-// appends it to the queue's buffer.
+// drop discards the queue if it is empty, so abandoned names don't accumulate.
+// Must hold b.mu.
+func (b *broker) drop(name string, q *queue) {
+	if b.queues[name] == q && len(q.messages) == 0 && len(q.waiters) == 0 {
+		delete(b.queues, name)
+	}
+}
+
+// Put hands the message to the oldest waiting consumer, or buffers it.
 func (b *broker) Put(name, msg string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	q := b.queue(name)
-	if len(q.waiters) > 0 {
-		w := q.waiters[0]
-		q.waiters = q.waiters[1:]
-		w <- msg // buffered (cap 1): never blocks while holding the lock
-		return
+	if !q.dispatch(msg) {
+		q.messages = append(q.messages, msg)
 	}
-	q.messages = append(q.messages, msg)
 }
 
 // Take removes the next message in FIFO order. If the queue is empty it waits
@@ -74,10 +89,12 @@ func (b *broker) Take(ctx context.Context, name string, timeout time.Duration) (
 	if len(q.messages) > 0 {
 		msg := q.messages[0]
 		q.messages = q.messages[1:]
+		b.drop(name, q)
 		b.mu.Unlock()
 		return msg, true
 	}
 	if timeout <= 0 {
+		b.drop(name, q)
 		b.mu.Unlock()
 		return "", false
 	}
@@ -99,10 +116,21 @@ func (b *broker) Take(ctx context.Context, name string, timeout time.Duration) (
 	for i, c := range q.waiters {
 		if c == w { // still queued: cancel our spot, the next message goes to someone else
 			q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
+			b.drop(name, q)
 			return "", false
 		}
 	}
-	return <-w, true // a Put delivered just as we woke up: take it rather than drop it
+	// A Put delivered to us just as we woke. Take it, unless the client is gone:
+	// then re-deliver into the live queue (re-fetched, as ours may be dropped).
+	msg := <-w
+	if ctx.Err() != nil {
+		live := b.queue(name)
+		if !live.dispatch(msg) {
+			live.messages = append([]string{msg}, live.messages...)
+		}
+		return "", false
+	}
+	return msg, true
 }
 
 // handler exposes a Producer/Consumer over HTTP. It depends on the interfaces,
