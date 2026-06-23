@@ -291,3 +291,74 @@ func TestNoMessageLostWhenConsumersDisconnect(t *testing.T) {
 		t.Fatalf("accounted for %d of %d messages; some were lost", len(seen), n)
 	}
 }
+
+func TestPutWithEmptyValueIsAccepted(t *testing.T) {
+	h := newHandler()
+	if code := do(h, "PUT", "/pet?v=").Code; code != http.StatusOK { // v present but empty
+		t.Fatalf("PUT /pet?v= : code %d, want 200", code)
+	}
+	w := do(h, "GET", "/pet")
+	if w.Code != http.StatusOK || w.Body.String() != "" {
+		t.Fatalf("GET /pet : code %d body %q, want 200 + empty body", w.Code, w.Body.String())
+	}
+}
+
+func TestMalformedTimeoutIsBadRequest(t *testing.T) {
+	h := newHandler()
+	for _, ts := range []string{"abc", "-3", "1.5"} {
+		if code := do(h, "GET", "/pet?timeout="+ts).Code; code != http.StatusBadRequest {
+			t.Fatalf("GET /pet?timeout=%s : code %d, want 400", ts, code)
+		}
+	}
+}
+
+func TestEmptyQueueNameIsBadRequest(t *testing.T) {
+	h := newHandler()
+	if code := do(h, "PUT", "/?v=x").Code; code != http.StatusBadRequest {
+		t.Fatalf("PUT /?v=x : code %d, want 400", code)
+	}
+	if code := do(h, "GET", "/").Code; code != http.StatusBadRequest {
+		t.Fatalf("GET / : code %d, want 400", code)
+	}
+}
+
+// TestLateMessageDoesNotSatisfyExpiredGet forces a Put to deliver to a waiter
+// strictly after its timeout has fired (white-box: by blocking the consumer's
+// post-timeout cleanup on the broker lock, then delivering as a Put would). The
+// expired GET must report no result, and the late message must be preserved for
+// the next consumer rather than dropped.
+func TestLateMessageDoesNotSatisfyExpiredGet(t *testing.T) {
+	b := newBroker()
+	type result struct {
+		msg string
+		ok  bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		msg, ok := b.Take(context.Background(), "q", 20*time.Millisecond)
+		done <- result{msg, ok}
+	}()
+
+	// Acquire the lock only once the consumer has registered as a waiter, then
+	// hold it past the 20ms deadline so the consumer's cleanup is blocked.
+	for {
+		b.mu.Lock()
+		if q := b.queues["q"]; q != nil && len(q.waiters) == 1 {
+			break
+		}
+		b.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(40 * time.Millisecond) // deadline fires; consumer blocks on cleanup
+	w := b.queues["q"].waiters[0]     // deliver "late" exactly as Put would, but
+	b.queues["q"].waiters = nil       // after the deadline
+	w <- "late"
+	b.mu.Unlock()
+
+	if r := <-done; r.ok {
+		t.Fatalf("expired GET returned %q; a post-deadline message must not satisfy it", r.msg)
+	}
+	if msg, ok := b.Take(context.Background(), "q", 0); !ok || msg != "late" {
+		t.Fatalf("late message lost: ok=%v msg=%q (must remain for the next consumer)", ok, msg)
+	}
+}

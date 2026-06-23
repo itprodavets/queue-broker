@@ -114,23 +114,22 @@ func (b *broker) Take(ctx context.Context, name string, timeout time.Duration) (
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for i, c := range q.waiters {
-		if c == w { // still queued: cancel our spot, the next message goes to someone else
+		if c == w { // nothing arrived before the deadline: cancel our spot
 			q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
 			b.drop(name, q)
 			return "", false
 		}
 	}
-	// A Put delivered to us just as we woke. Take it, unless the client is gone:
-	// then re-deliver into the live queue (re-fetched, as ours may be dropped).
+	// A Put reached us, but only after the deadline (or cancellation) had already
+	// fired — the wait has failed. We must not satisfy an expired GET, so report
+	// no result and re-deliver the message to the next consumer instead of
+	// dropping it. The queue is re-fetched because ours may have been reclaimed.
 	msg := <-w
-	if ctx.Err() != nil {
-		live := b.queue(name)
-		if !live.dispatch(msg) {
-			live.messages = append([]string{msg}, live.messages...)
-		}
-		return "", false
+	live := b.queue(name)
+	if !live.dispatch(msg) {
+		live.messages = append([]string{msg}, live.messages...)
 	}
-	return msg, true
+	return "", false
 }
 
 // handler exposes a Producer/Consumer over HTTP. It depends on the interfaces,
@@ -142,17 +141,25 @@ type handler struct {
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Path[1:]
+	query := r.URL.Query()
+	if name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
-		v := r.URL.Query().Get("v")
-		if v == "" {
+		if !query.Has("v") { // absent v is a bad request; an empty value is allowed
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		h.producer.Put(name, v)
+		h.producer.Put(name, query.Get("v"))
 	case http.MethodGet:
-		timeout, _ := strconv.Atoi(r.URL.Query().Get("timeout"))
-		if msg, ok := h.consumer.Take(r.Context(), name, time.Duration(timeout)*time.Second); ok {
+		timeout, err := parseTimeout(query.Get("timeout"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if msg, ok := h.consumer.Take(r.Context(), name, timeout); ok {
 			fmt.Fprint(w, msg)
 		} else {
 			w.WriteHeader(http.StatusNotFound)
@@ -160,6 +167,19 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// parseTimeout reads the optional timeout parameter (in seconds). An absent
+// value means "do not wait"; a malformed or negative value is a bad request.
+func parseTimeout(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid timeout %q", s)
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 func main() {
